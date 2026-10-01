@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -87,4 +88,25 @@ func newState(name string, nodes []NodeDef) *WorkflowState {
 		st.Nodes[n.Name] = &NodeState{Status: StatusPending, Attempts: 0}
 	}
 	return st
+}
+
+// RetryReport 汇总共享重试预算的使用情况：
+// 每个节点消耗的重试次数为 max(Attempts-1, 0)（首次尝试不扣预算）；
+// BudgetBlocked 节点按名称排序返回，保证报告结果确定。
+func (s *WorkflowState) RetryReport() RetryReport {
+	r := RetryReport{
+		Budget:  s.RetryBudget,
+		Used:    s.RetriesUsed,
+		PerNode: make(map[string]int, len(s.Nodes)),
+	}
+	for name, n := range s.Nodes {
+		if n.Attempts > 1 {
+			r.PerNode[name] = n.Attempts - 1
+		}
+		if n.BudgetBlocked {
+			r.BudgetBlocked = append(r.BudgetBlocked, name)
+		}
+	}
+	sort.Strings(r.BudgetBlocked)
+	return r
 }

@@ -39,6 +39,12 @@ func backoff(p RetryPolicy, failureCount int) time.Duration {
 // runNode 在当前 goroutine 内按重试策略执行单个节点，直到成功、重试耗尽或 ctx 取消。
 // st.Attempts 为此前（含历史进程）已发起的尝试次数；恢复时沿用该计数，保证节点不会超额重试。
 // 每次状态变更都通过 onUpdate 回调落盘。返回该节点的最终 Status。
+//
+// reserveRetry 在节点首次尝试失败、准备发起第 (st.Attempts+1) 次尝试前由引擎在锁内调用：
+// 引擎原子地判断并扣减运行级共享重试预算。返回：
+//   - granted=true：已扣得 1 次共享重试，应继续尝试；
+//   - granted=false, budgeted=false：未启用共享预算，调用方按节点自身 MaxAttempts 判断；
+//   - granted=false, budgeted=true：共享预算已耗尽，节点必须立即按重试耗尽失败处理。
 func runNode(
 	ctx context.Context,
 	def NodeDef,
@@ -46,6 +52,7 @@ func runNode(
 	policy RetryPolicy,
 	st *NodeState,
 	onUpdate func(*NodeState),
+	reserveRetry func(node string, nextAttempt int) (granted bool, budgeted bool),
 ) Status {
 	policy = normalizeRetry(policy)
 
@@ -56,8 +63,32 @@ func runNode(
 			onUpdate(st)
 			return StatusFailed
 		}
-		if st.Attempts >= policy.MaxAttempts {
-			// 重试预算耗尽（恢复场景下进入时即可能成立）。
+
+		// 首次尝试不消耗共享预算；首次失败后的再次尝试才申请预算。
+		if st.Attempts > 0 {
+			// 先检查节点自身上限：已达 MaxAttempts 时直接永久失败，不占用共享预算。
+			if st.Attempts >= policy.MaxAttempts {
+				st.Status = StatusFailed
+				if st.LastError == "" {
+					st.LastError = "retry budget exhausted"
+				}
+				onUpdate(st)
+				return StatusFailed
+			}
+			// 再向运行级共享预算申请 1 次重试（引擎在锁内原子扣减）。
+			if granted, budgeted := reserveRetry(def.Name, st.Attempts+1); budgeted && !granted {
+				// 共享预算已耗尽：永久失败，并保留最近一次失败原因。
+				st.Status = StatusFailed
+				st.BudgetBlocked = true
+				if st.LastError == "" {
+					st.LastError = "run retry budget exhausted"
+				}
+				st.FinishedAt = time.Now().UTC()
+				onUpdate(st)
+				return StatusFailed
+			}
+		} else if st.Attempts >= policy.MaxAttempts {
+			// 恢复场景下进入时即可能成立（MaxAttempts<=0 规整为 1，正常不会命中）。
 			if st.Status != StatusSucceeded {
 				st.Status = StatusFailed
 				if st.LastError == "" {
