@@ -90,23 +90,41 @@ func newState(name string, nodes []NodeDef) *WorkflowState {
 	return st
 }
 
-// RetryReport 汇总共享重试预算的使用情况：
-// 每个节点消耗的重试次数为 max(Attempts-1, 0)（首次尝试不扣预算）；
-// BudgetBlocked 节点按名称排序返回，保证报告结果确定。
+// RetryReport 汇总本次运行的重试情况，口径与 RetryReport 类型注释一致：
+//   - 每节点重试次数 = max(Attempts-1, 0)（首次尝试不算重试），未重试节点显式记 0；
+//   - Used 直接对各节点重试次数求和——这是“实际发生了多少次重试”的唯一口径，
+//     无论是否配置共享预算（RetryBudget==0 时预算账本 RetriesUsed 恒为 0，
+//     若直接读账本就会出现“每节点非 0、总数却是 0”的自相矛盾）；
+//   - 数据全部来自持久化的各节点 Attempts，因此取消后出报告、或中断重启后再出报告，
+//     已发生的重试不回零、未发生的重试不虚增；
+//   - BudgetBlocked / OwnLimitExhausted 按名称排序返回，保证报告结果确定。
 func (s *WorkflowState) RetryReport() RetryReport {
 	r := RetryReport{
 		Budget:  s.RetryBudget,
-		Used:    s.RetriesUsed,
 		PerNode: make(map[string]int, len(s.Nodes)),
 	}
-	for name, n := range s.Nodes {
-		if n.Attempts > 1 {
-			r.PerNode[name] = n.Attempts - 1
+	// 固定遍历顺序仅用于确定性日志；map 本身的写入顺序不影响结果。
+	names := make([]string, 0, len(s.Nodes))
+	for name := range s.Nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		n := s.Nodes[name]
+		retries := n.Attempts - 1
+		if retries < 0 {
+			retries = 0
 		}
+		r.PerNode[name] = retries
+		r.Used += retries
 		if n.BudgetBlocked {
 			r.BudgetBlocked = append(r.BudgetBlocked, name)
 		}
+		if n.AttemptLimitExhausted {
+			r.OwnLimitExhausted = append(r.OwnLimitExhausted, name)
+		}
 	}
 	sort.Strings(r.BudgetBlocked)
+	sort.Strings(r.OwnLimitExhausted)
 	return r
 }

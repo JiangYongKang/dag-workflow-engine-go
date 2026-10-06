@@ -42,7 +42,7 @@ if err != nil { /* 定义非法，见下“错误归类” */ }
 res, err := engine.Run(ctx)
 res.Succeeded // 整体成功 / 整体失败可区分
 res.Resumed   // 本次是否基于历史状态恢复
-report := res.State.RetryReport() // 预算总用量 / 每节点用量 / 预算阻断节点
+report := res.State.RetryReport() // 实际重试总数 Used / 每节点次数 / 两种终止原因列表
 ```
 
 运行示例：
@@ -104,19 +104,41 @@ go build -o /tmp/dag-demo ./cmd/demo
 - 节点自身的 `MaxAttempts` 仍然生效：达到自身上限的节点直接失败，**不占用**共享预算。
 - `MaxRetries<=0`（零值）表示不启用共享预算，重试只受各节点 `MaxAttempts` 约束，即旧用法。
 
-事后通过 `state.RetryReport()` 可解释预算去向：
+事后通过 `state.RetryReport()` 可解释每次重试的去向（**无论是否配置共享预算，口径都一致**）：
 
 | 字段 | 含义 |
 | --- | --- |
-| `Budget` | 共享重试总次数（0 表示不限制） |
-| `Used` | 本次运行已消耗的重试总次数（跨所有节点、跨重启累计） |
-| `PerNode` | 每个节点各自消耗的重试次数（`Attempts-1`，首次尝试不计） |
-| `BudgetBlocked` | 因共享预算耗尽而未再重试的节点名（按名称排序） |
+| `Budget` | 共享重试总次数（0 表示不限制，即旧用法） |
+| `Used` | 本次运行**实际发生的重试总数**（跨所有节点、跨重启累计），恒等于 `Σ PerNode` |
+| `PerNode` | 每个节点各自实际重试的次数（`max(Attempts-1,0)`，首次尝试不计）；没重试过的节点也显式记 `0` |
+| `BudgetBlocked` | 因**共享预算被别的节点先用完**而未再重试的节点名（按名称排序） |
+| `OwnLimitExhausted` | 因**节点自身 `MaxAttempts` 用尽**而未再重试的节点名（按名称排序） |
 
-`RetryBudget` 与 `RetriesUsed` 都是 `WorkflowState` 的持久化字段：进程重启后沿用，不会重置；
-预算扣减与节点 `Attempts` 在同一把锁、同一次落盘内完成，不会出现"预算扣了但尝试没记账"。
-注意预算总量取自**首次启动时的配置并落盘**，之后即使配置改动，恢复的仍是同一份运行，
-预算不随之改变（与"一次运行一个预算"的语义一致）。
+重试统计口径（什么算一次重试、总数怎么算）：
+
+- **一次重试的定义**：节点的首次尝试不算重试；同一节点第 2 次及以后**实际发起**的每一次尝试各算 1 次。
+  因此 `PerNode[name] = max(Attempts-1, 0)`，从头到尾没重试过的节点记 `0`，不会虚增。
+- **总数恒等式**：`Used = Σ PerNode`。`Used` 由持久化的各节点 `Attempts` 现算，**不直接读预算账本**
+  `RetriesUsed`——旧用法（`Budget=0`）下根本不存在共享预算账本，若直接读账本会出现
+  “每节点重试次数非 0、总数却是 0”的自相矛盾。
+- **中断/取消语义**：运行被取消、尚未结算终态时也可以调用 `RetryReport()`，只统计截至此刻
+  **已经发起**的重试；重启恢复后沿用落盘的 `Attempts` 接着累计，已发生的不清零、未发生的不预支。
+- **两种“不再重试”严格区分**（`BudgetBlocked` 与 `OwnLimitExhausted` 两个列表互斥，计数互不混淆）：
+  - 节点自身 `MaxAttempts` 用尽 → 节点 `failed` 且 `NodeState.AttemptLimitExhausted=true`，
+    出现在 `OwnLimitExhausted`；该路径**不占用**共享预算；
+  - 自身上限没用尽，但申请重试时共享预算已被别的节点扣完 → 节点 `failed` 且
+    `NodeState.BudgetBlocked=true`，出现在 `BudgetBlocked`，`LastError` 保留最近一次真实失败原因。
+    该节点的下游照常按失败传播规则标记 `skipped`。
+  - 节点恢复/重新发起尝试时两个标记都会清除，成功节点上不会残留旧标记。
+- **账本与实际用量的差别**：`WorkflowState.RetriesUsed` 是共享预算的**预留账本**（重试在发起前
+  先扣 1 并落盘，用于调度时判定预算是否用尽）。正常跑完时它与 `Used` 相等；只有在极端崩溃窗口
+  （预算已预留、重试尝试尚未记账时进程退出）下账本可能比实际重试多 1。报告的 `Used` 永远只反映
+  实际重试，因此即使遇到该窗口，`Used == Σ PerNode` 的口径仍然成立。
+- `RetryBudget` 与 `RetriesUsed` 都是 `WorkflowState` 的持久化字段：进程重启后沿用，不会重置；
+  预算扣减与节点 `Attempts` 在同一把锁、同一次落盘内完成。预算总量取自**首次启动时的配置并落盘**，
+  之后即使配置改动，恢复的仍是同一份运行，预算不随之改变（与"一次运行一个预算"的语义一致）。
+- `MaxRetries<=0`（零值）表示不启用共享预算，重试只受各节点 `MaxAttempts` 约束，即旧用法；
+  此时 `Budget=0`、账本恒为 0，但 `Used`/`PerNode` 仍如实统计实际重试。
 
 ## 恢复语义
 
@@ -152,8 +174,10 @@ go build -o /tmp/dag-demo ./cmd/demo
   （同优先级按定义顺序）、重试次数与成败结果与升级前完全一致，由
   `TestLegacyConfigUnchanged` 锁定。
 - **旧状态文件可直接加载**：旧版 JSON 没有 `RetryBudget`/`RetriesUsed`/`BudgetBlocked`
-  字段时，反序列化为零值，等价于"未启用共享预算"；旧状态中的 `failed` 节点仍按
-  原 `Attempts >= MaxAttempts` 规则判定是否永久失败。新字段都是追加字段，不改动原有字段含义。
+  /`AttemptLimitExhausted` 字段时，反序列化为零值：预算零值等价于"未启用共享预算"，
+  终止原因零值等价于"未因该原因终止"（旧状态中的 `failed` 节点仍按原 `Attempts >= MaxAttempts`
+  规则判定是否永久失败，`OwnLimitExhausted` 报告会在节点真正再次跑到上限时才补齐标记）。
+  新字段都是追加字段，不改动原有字段含义。
 - 新规则只对**新发起**的运行生效：用旧状态恢复时，预算为 0（不限制），行为与旧引擎一致；
   只有首次以 `MaxRetries>0` 的配置启动的运行才会落盘并使用共享预算。
 
@@ -163,7 +187,16 @@ go build -o /tmp/dag-demo ./cmd/demo
 go test ./... -count=1 -v     # 查看每个用例的输入与判定依据日志
 go test -race ./...           # 重复调度 / 并发状态冲突检测
 go test ./workflow/ -run 'TestPrioritySchedulingUnderConcurrency|TestSharedRetryBudgetExhaustion|TestRestartBudgetAndSchedulingPersist' -count=20  # 重复跑验证调度确定性
+go test ./workflow/ -run 'TestRetryReport' -v -count=10   # 重复跑验证重试统计口径与中断时序
 go vet ./...
+```
+
+也可以直接运行 demo 观察报告（第二次运行演示断点恢复）：
+
+```bash
+go run ./cmd/demo -state /tmp/demo-state.json
+# 末行输出形如：retry report: total=2 (budget=0) per-node=map[extract:0 load:0 transform:2] own-limit-exhausted=[] budget-blocked=[]
+# total 即实际重试总数，恒等于 per-node 中各值之和
 ```
 
 测试覆盖：
@@ -184,6 +217,17 @@ go vet ./...
 - `TestRestartBudgetAndSchedulingPersist`：中断后预算已用量/总量、成功节点、预算阻断
   终态跨三次进程保持一致，整体成败判定重启前后不矛盾；
 - `TestLegacyConfigUnchanged`：不设预算与优先级时调度顺序、重试耗尽语义与结果均不变。
+- `TestRetryReportLegacyTotalEqualsPerNodeSum`：旧用法（无共享预算）下有节点重试时，
+  报告 `Used` 不再恒为 0，稳定复现并锁定修复；同时校验 `Used==ΣPerNode`、未重试节点记 0、
+  以及“自身上限耗尽”归类。
+- `TestRetryReportDistinguishesStopReasons`：同一场景内同时出现自身上限耗尽节点与
+  预算阻断节点，断言两个列表互斥、节点标记一对一、`Used==ΣPerNode`。
+- `TestRetryReportResumeKeepsCount`：旧用法下取消于退避窗口（运行未到终态）时报告只含
+  已发生的 1 次重试；恢复后只补跑第 3、4 次尝试，总数/每节点计数接着累计到 3，不重置不重复，
+  成功节点不残留终止标记。
+- `TestRetryReportResumeWithSharedBudget`：启用共享预算（2 次）下中断重启，b 跨进程用尽预算
+  后成功、c 首次失败即被预算阻断、a 全程 0 重试；断言 `Used`、账本、`ΣPerNode` 三者一致，
+  且预算阻断与自身上限耗尽列表分别正确。
 
 单测日志通过 `t.Logf` 打印输入参数与判定依据，`Engine.WithLogger(t.Logf)` 会额外输出
 `[schedule]` / `[run]` / `[done]` / `[skip]` 的完整调度轨迹。
@@ -195,12 +239,17 @@ go vet ./...
   "WorkflowName": "my-wf",
   "Nodes": {
     "a": {"Status": "succeeded", "Attempts": 1, ...},
-    "b": {"Status": "failed", "Attempts": 3, "LastError": "boom on attempt 3", "BudgetBlocked": true}
+    "b": {"Status": "failed", "Attempts": 3, "LastError": "boom on attempt 3", "AttemptLimitExhausted": true},
+    "d": {"Status": "failed", "Attempts": 2, "LastError": "boom on attempt 2", "BudgetBlocked": true}
   },
   "Finished": true,
   "Succeeded": false,
   "RetryBudget": 5,
-  "RetriesUsed": 5,
+  "RetriesUsed": 3,
   "UpdatedAt": "2026-09-23T00:00:00Z"
 }
 ```
+
+上例中 b 重试 2 次后**自身上限耗尽**（`AttemptLimitExhausted`），d 重试 1 次后因**共享预算被
+其他节点用完**而终止（`BudgetBlocked`）；`RetryReport()` 会给出 `Used=3`、
+`PerNode={a:0,b:2,d:1}`、`OwnLimitExhausted=[b]`、`BudgetBlocked=[d]`。

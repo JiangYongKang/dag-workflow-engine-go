@@ -69,6 +69,8 @@ func runNode(
 			// 先检查节点自身上限：已达 MaxAttempts 时直接永久失败，不占用共享预算。
 			if st.Attempts >= policy.MaxAttempts {
 				st.Status = StatusFailed
+				// 与“共享预算耗尽”严格区分：这是节点自身重试上限用尽。
+				st.AttemptLimitExhausted = true
 				if st.LastError == "" {
 					st.LastError = "retry budget exhausted"
 				}
@@ -91,6 +93,7 @@ func runNode(
 			// 恢复场景下进入时即可能成立（MaxAttempts<=0 规整为 1，正常不会命中）。
 			if st.Status != StatusSucceeded {
 				st.Status = StatusFailed
+				st.AttemptLimitExhausted = true
 				if st.LastError == "" {
 					st.LastError = "retry budget exhausted"
 				}
@@ -105,6 +108,10 @@ func runNode(
 		}
 		st.Status = StatusRunning
 		st.LastError = ""
+		// 又发起了一次新尝试：此前任何“不再重试”的原因标记都已过时，必须清除，
+		// 否则恢复场景下旧标记会残留到成功之后，污染报告里的原因归类。
+		st.BudgetBlocked = false
+		st.AttemptLimitExhausted = false
 		onUpdate(st)
 
 		attemptCtx := ctx
@@ -129,6 +136,9 @@ func runNode(
 		st.LastError = err.Error()
 		if st.Attempts >= policy.MaxAttempts {
 			st.Status = StatusFailed
+			// 自身 MaxAttempts 用尽：与 BudgetBlocked（共享预算被别人用完）区分，
+			// 两类节点的计数在 RetryReport 中分别列出、互不混淆。
+			st.AttemptLimitExhausted = true
 			st.FinishedAt = time.Now().UTC()
 			onUpdate(st)
 			return StatusFailed

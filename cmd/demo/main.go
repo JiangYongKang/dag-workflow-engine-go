@@ -67,6 +67,11 @@ func main() {
 		log.Fatalf("run error: %v", err)
 	}
 	fmt.Printf("succeeded=%v resumed=%v\n", result.Succeeded, result.Resumed)
+
+	// 重试统计：Used 为实际发生的重试总数（恒等于 PerNode 之和，与是否配置共享预算无关）。
+	rep := result.State.RetryReport()
+	fmt.Printf("retry report: total=%d (budget=%d) per-node=%v own-limit-exhausted=%v budget-blocked=%v\n",
+		rep.Used, rep.Budget, rep.PerNode, rep.OwnLimitExhausted, rep.BudgetBlocked)
 	if !result.Succeeded {
 		os.Exit(1)
 	}

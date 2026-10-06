@@ -62,6 +62,10 @@ type NodeState struct {
 	// BudgetBlocked 标记该节点是否因为运行级共享重试预算耗尽而未再重试，
 	// 用于事后区分“本节点 MaxAttempts 耗尽”与“全局预算用完”。
 	BudgetBlocked bool
+	// AttemptLimitExhausted 标记该节点是否因为自身 MaxAttempts 用尽而未再重试。
+	// 与 BudgetBlocked 互斥：二者分别对应“自身上限耗尽”与“共享预算被用完”
+	// 两种不再重试的原因，节点重新发起尝试时两个标记都会清除，避免旧标记残留。
+	AttemptLimitExhausted bool
 }
 
 // WorkflowState 是整个工作流的持久化状态。
@@ -74,17 +78,39 @@ type WorkflowState struct {
 	// RetryBudget 为本次运行的共享重试总次数（首次启动时取自 Config.MaxRetries，
 	// 恢复时沿用持久化值）；0 表示不启用共享预算。
 	RetryBudget int
-	// RetriesUsed 为已消耗的共享重试次数，与节点 Attempts 一同持久化，
-	// 中断重启后不丢失、不重置。
+	// RetriesUsed 为已预留（扣减）的共享重试次数账本，仅在 RetryBudget>0 时增长，
+	// 与节点 Attempts 一同持久化，中断重启后不丢失、不重置。它用于调度时判断预算
+	// 是否用尽；重试在“发起前”预留并落盘，所以进程恰在预留之后、尝试记账之前
+	// 崩溃时，该值可能比实际发生的重试多 1。RetryReport.Used 只按实际 Attempts
+	// 统计实际重试，不直接采用该账本，保证报告口径始终等于各节点重试次数之和。
 	RetriesUsed int
 }
 
-// RetryReport 汇总一次运行的共享重试预算使用情况。
+// RetryReport 汇总一次运行的重试情况。
+//
+// 口径（无论是否配置共享重试预算都一致）：
+//   - 节点的首次尝试不算重试；同一节点第 2 次及以后的每一次尝试各算 1 次重试；
+//   - PerNode[name] = max(Attempts-1, 0)，从头到尾没重试过的节点记为 0；
+//   - Used 为本次运行实际发生的重试总数，恒等于 sum(PerNode)；
+//     报告按持久化的各节点 Attempts 现算，因此取消后未到终态、或中断重启后，
+//     都只统计已经实际发起过的重试，既不回零也不虚增。
+//   - BudgetBlocked 与 OwnLimitExhausted 分别列出因两种不同原因不再重试的节点，
+//     两者互斥、计数互不混淆（一个节点不可能同时出现在两个列表里）。
 type RetryReport struct {
-	Budget        int            // 共享重试总次数；0 表示不限制
-	Used          int            // 已消耗的重试次数（跨所有节点）
-	PerNode       map[string]int // 每个节点消耗的重试次数（首次尝试不计）
-	BudgetBlocked []string       // 因共享预算耗尽而未再重试的节点（按名称排序）
+	// Budget 为共享重试总次数；0 表示不限制（旧用法）。
+	Budget int
+	// Used 为实际发生的重试总数（跨所有节点、跨重启累计），恒等于 PerNode 之和。
+	// 注意它不是“共享预算账本”：共享预算的账本是 WorkflowState.RetriesUsed，
+	// 预算在重试发起前预留，极端情况下可能比实际重试多 1（预留后进程即崩溃）；
+	// Used 只如实反映实际发生的重试。
+	Used int
+	// PerNode 为每个节点实际重试的次数（Attempts-1，首次尝试不计）；
+	// 未发生重试的节点也显式记为 0，避免读取方对“缺键”和“0 次”产生歧义。
+	PerNode map[string]int
+	// BudgetBlocked 为因共享预算被别的节点先用完而未再重试的节点（按名称排序）。
+	BudgetBlocked []string
+	// OwnLimitExhausted 为因节点自身 MaxAttempts 用尽而未再重试的节点（按名称排序）。
+	OwnLimitExhausted []string
 }
 
 // RunResult 是一次 Run 调用的最终结果。
