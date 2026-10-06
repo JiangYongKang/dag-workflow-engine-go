@@ -66,7 +66,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("run error: %v", err)
 	}
-	fmt.Printf("succeeded=%v resumed=%v\n", result.Succeeded, result.Resumed)
+	rep := result.State.RetryReport()
+	fmt.Printf("succeeded=%v resumed=%v retries total=%d (budget=%d) per-node=%v budget-blocked=%v\n",
+		result.Succeeded, result.Resumed, rep.Used, rep.Budget, rep.PerNode, rep.BudgetBlocked)
 	if !result.Succeeded {
 		os.Exit(1)
 	}

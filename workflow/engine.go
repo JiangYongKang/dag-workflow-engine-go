@@ -201,9 +201,13 @@ func (e *Engine) reconcileState(saved *WorkflowState) *WorkflowState {
 		}
 		st.Nodes[n.Name] = &cp
 	}
-	// 共享预算属于一次运行：恢复时沿用已持久化的预算与已消耗量，绝不重置。
+	// 共享预算属于一次运行：恢复时沿用已持久化的预算总量，绝不重置。
 	st.RetryBudget = saved.RetryBudget
-	st.RetriesUsed = saved.RetriesUsed
+	// 重试总数以各节点 Attempts 为唯一事实来源核对（等价于 Σmax(Attempts-1,0)）：
+	// 已经发生的重试随 Attempts 保留、不清零；旧版状态文件（RetriesUsed 漏记）或
+	// 极端中断残留（已扣未跑的幻影计数）也在此收敛，保证重启后“总数==各节点之和”，
+	// 不会凭空多算。
+	st.RetriesUsed = st.totalRetries()
 	return st
 }
 
@@ -365,30 +369,32 @@ func (e *Engine) executeNode(ctx context.Context, name string, wg *sync.WaitGrou
 				e.logf("[warn] persist node=%q: %v", name, err)
 			}
 		},
-		// reserveRetry：在引擎锁内为第 nextAttempt 次尝试原子申请共享重试预算。
-		// 预算字段与节点 Attempts 同处一把锁、同一次落盘，中断重启后不会出现
-		// “预算扣了但尝试没记账”或相反的不一致。
+		// beginRetry：节点首次尝试失败后、准备发起第 nextAttempt 次尝试前，
+		// 在引擎锁内一次性完成“预算闸门判定 + Attempts+1 + RetriesUsed+1 + running
+		// 占位”并同一次落盘。只有这一个地方会产生新的重试计数，因此任何持久化时刻
+		// 都有不变式：RetriesUsed == Σmax(Attempts-1,0)，不存在“预算扣了但尝试没
+		// 记账”的幻影计数，也不会重复计。
 		//
-		// 注意：这里不直接改 map 里的 NodeState.Attempts——执行循环手中的 st
-		// 才是该节点的单一数据源，随后 attempt 开始时的 onUpdate 会把新 Attempts
-		// 整体回写；若先改 map 会被旧快照覆盖。
-		func(node string, nextAttempt int) (granted bool, budgeted bool) {
+		// 注意：map 条目与执行循环手中的 st 快照在这里同步递增；随后的尝试结果
+		// （成功/失败）仍由 onUpdate 整体回写，二者操作同一条目的不同阶段。
+		func(node string, nextAttempt int) bool {
 			e.mu.Lock()
 			defer e.mu.Unlock()
-			if e.state.RetryBudget <= 0 {
-				return false, false // 未启用共享预算：交给节点自身 MaxAttempts 判定
-			}
-			budgeted = true
-			if e.state.RetriesUsed >= e.state.RetryBudget {
-				e.logf("[budget] node=%q attempt=%d denied used=%d/%d",
+			if e.state.RetryBudget > 0 && e.state.RetriesUsed >= e.state.RetryBudget {
+				e.logf("[retry] node=%q attempt=%d denied: shared budget exhausted used=%d/%d",
 					node, nextAttempt, e.state.RetriesUsed, e.state.RetryBudget)
-				return false, true
+				return false
 			}
+			cur := e.state.Nodes[node]
+			cur.Attempts++
+			cur.Status = StatusRunning
 			e.state.RetriesUsed++
-			e.logf("[budget] node=%q attempt=%d granted used=%d/%d",
+			e.logf("[retry] node=%q attempt=%d granted used=%d budget=%d",
 				node, nextAttempt, e.state.RetriesUsed, e.state.RetryBudget)
-			_ = e.store.Save(e.state)
-			return true, true
+			if err := e.store.Save(e.state); err != nil {
+				e.logf("[warn] persist retry node=%q: %v", node, err)
+			}
+			return true
 		},
 	)
 	e.logf("[done] node=%q final=%s attempts=%d error=%q budgetBlocked=%v",

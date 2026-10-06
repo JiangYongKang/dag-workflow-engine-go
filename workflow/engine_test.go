@@ -321,12 +321,16 @@ func TestRestartResumeRetriesThenSuccess(t *testing.T) {
 	cfg2 := Config{MaxConcurrency: 2, DefaultRetry: RetryPolicy{MaxAttempts: 3, InitialBackoff: time.Millisecond}}
 
 	// 第一次进程：a 成功；b 第 1 次尝试失败，长退避期间进程被取消（模拟重启）。
+	// 用确定性信号代替 time.Sleep：b 首次失败返回后、进入长退避前关闭通道，
+	// 测试收到信号再取消，取消点必然落在退避窗口内，不再依赖机器调度时序。
 	var aCalls int32
 	callsB := int32(1)
+	bFailedCh := make(chan struct{})
 	reg1 := TaskRegistry{
 		"a": func(context.Context, string, int) error { atomic.AddInt32(&aCalls, 1); return nil },
 		"b": func(ctx context.Context, _ string, attempt int) error {
 			if attempt == 1 {
+				close(bFailedCh)
 				return errors.New("first failure")
 			}
 			<-ctx.Done() // 不应走到：第 2 次尝试前进程即被取消
@@ -338,7 +342,10 @@ func TestRestartResumeRetriesThenSuccess(t *testing.T) {
 	e1.WithLogger(t.Logf)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(15 * time.Millisecond) // 落在 b 失败后退避窗口内
+		select {
+		case <-bFailedCh: // b 已首次失败，随后进入长退避，此刻取消必然落在退避中
+		case <-time.After(2 * time.Second):
+		}
 		cancel()
 	}()
 	res1, err := e1.Run(ctx)

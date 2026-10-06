@@ -74,17 +74,20 @@ type WorkflowState struct {
 	// RetryBudget 为本次运行的共享重试总次数（首次启动时取自 Config.MaxRetries，
 	// 恢复时沿用持久化值）；0 表示不启用共享预算。
 	RetryBudget int
-	// RetriesUsed 为已消耗的共享重试次数，与节点 Attempts 一同持久化，
-	// 中断重启后不丢失、不重置。
+	// RetriesUsed 为整次运行已实际发生的重试次数（跨所有节点、跨重启累计），
+	// 口径恒等于各节点 max(Attempts-1,0) 之和：一次“重试”指某节点首次尝试之后
+	// 实际发起的每一次尝试，与是否启用共享预算无关。启用共享预算时，它同时是
+	// 预算的已消耗量（先到先扣）；不启用时仍如实累计，只是不作为闸门使用。
+	// 该字段持久化；重启规整时以各节点 Attempts 为准重新核对，不清零、不重复计。
 	RetriesUsed int
 }
 
-// RetryReport 汇总一次运行的共享重试预算使用情况。
+// RetryReport 汇总一次运行的重试统计。
 type RetryReport struct {
-	Budget        int            // 共享重试总次数；0 表示不限制
-	Used          int            // 已消耗的重试次数（跨所有节点）
-	PerNode       map[string]int // 每个节点消耗的重试次数（首次尝试不计）
-	BudgetBlocked []string       // 因共享预算耗尽而未再重试的节点（按名称排序）
+	Budget        int            // 共享重试总次数；0 表示不限制（不启用共享预算）
+	Used          int            // 本次运行已发生的重试总数，恒等于 PerNode 各值之和
+	PerNode       map[string]int // 每个节点的重试次数（max(Attempts-1,0)，首次尝试不计；未重试的节点显式为 0）
+	BudgetBlocked []string       // 因共享预算耗尽而未再重试的节点（按名称排序）；不在此列的 failed 节点即自身 MaxAttempts 耗尽
 }
 
 // RunResult 是一次 Run 调用的最终结果。

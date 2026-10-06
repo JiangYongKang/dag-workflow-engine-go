@@ -90,19 +90,44 @@ func newState(name string, nodes []NodeDef) *WorkflowState {
 	return st
 }
 
-// RetryReport 汇总共享重试预算的使用情况：
-// 每个节点消耗的重试次数为 max(Attempts-1, 0)（首次尝试不扣预算）；
-// BudgetBlocked 节点按名称排序返回，保证报告结果确定。
+// nodeRetries 返回某节点已实际发生的重试次数：首次尝试不计，
+// 此后每发起一次尝试（Attempts 的第 2 次及以后）计 1 次重试。
+// 退避等待期间被取消、第 2 次尝试尚未发起时不计。
+func nodeRetries(n *NodeState) int {
+	if n.Attempts > 1 {
+		return n.Attempts - 1
+	}
+	return 0
+}
+
+// totalRetries 按各节点 Attempts 汇总整次运行已发生的重试次数。
+// 它是重试计数的唯一事实来源：报告总数、预算扣账闸门、重启规整都以它为准，
+// 因此“总数 == 各节点重试次数之和”在任何时刻（含取消后未到终态）都成立，
+// 与是否配置共享重试预算无关。
+func (s *WorkflowState) totalRetries() int {
+	total := 0
+	for _, n := range s.Nodes {
+		total += nodeRetries(n)
+	}
+	return total
+}
+
+// RetryReport 汇总一次运行的重试情况：
+//   - PerNode 逐个节点列出已发生的重试次数 max(Attempts-1, 0)，从未重试的节点显式记 0；
+//   - Used 为各节点重试次数之和，无论是否配置共享预算都如实统计；
+//   - BudgetBlocked 为因共享预算耗尽而未再重试的节点，按名称排序，
+//     与“节点自身 MaxAttempts 耗尽”（failed 且 BudgetBlocked=false）严格区分。
 func (s *WorkflowState) RetryReport() RetryReport {
 	r := RetryReport{
 		Budget:  s.RetryBudget,
-		Used:    s.RetriesUsed,
 		PerNode: make(map[string]int, len(s.Nodes)),
 	}
 	for name, n := range s.Nodes {
-		if n.Attempts > 1 {
-			r.PerNode[name] = n.Attempts - 1
-		}
+		retries := nodeRetries(n)
+		// 每个节点都显式落项：从头到尾没重试过的节点记 0，不允许缺席导致对不上。
+		r.PerNode[name] = retries
+		// 总数直接由各节点计数求和，不另取可能漂移的计数器。
+		r.Used += retries
 		if n.BudgetBlocked {
 			r.BudgetBlocked = append(r.BudgetBlocked, name)
 		}

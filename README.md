@@ -104,17 +104,30 @@ go build -o /tmp/dag-demo ./cmd/demo
 - 节点自身的 `MaxAttempts` 仍然生效：达到自身上限的节点直接失败，**不占用**共享预算。
 - `MaxRetries<=0`（零值）表示不启用共享预算，重试只受各节点 `MaxAttempts` 约束，即旧用法。
 
-事后通过 `state.RetryReport()` 可解释预算去向：
+事后通过 `state.RetryReport()` 解释重试去向（**是否配置共享预算，统计口径完全一致**）：
 
-| 字段 | 含义 |
+**什么算一次重试**：某节点的**首次尝试不计**；首次尝试失败后，每**实际发起**一次后续尝试
+（即 `Attempts` 的第 2 次及以后）计 1 次重试。只在退避等待、下一次尝试尚未发起时不计；
+被共享预算拒绝、从未发起的那次尝试也不计。
+
+| 字段 | 含义与口径 |
 | --- | --- |
-| `Budget` | 共享重试总次数（0 表示不限制） |
-| `Used` | 本次运行已消耗的重试总次数（跨所有节点、跨重启累计） |
-| `PerNode` | 每个节点各自消耗的重试次数（`Attempts-1`，首次尝试不计） |
+| `Budget` | 共享重试总次数（0 表示不启用共享预算、不限制） |
+| `Used` | **本次运行已发生的重试总数**，口径为各节点重试次数之和 `Σ max(Attempts-1, 0)`；跨所有节点、跨重启累计；不设 `MaxRetries`（旧用法）时同样如实统计，不再恒为 0 |
+| `PerNode` | 每个节点各自的重试次数 `max(Attempts-1, 0)`（首次尝试不计）；**从头到尾没重试过的节点也显式记 0**，因此逐项相加必然等于 `Used` |
 | `BudgetBlocked` | 因共享预算耗尽而未再重试的节点名（按名称排序） |
 
-`RetryBudget` 与 `RetriesUsed` 都是 `WorkflowState` 的持久化字段：进程重启后沿用，不会重置；
-预算扣减与节点 `Attempts` 在同一把锁、同一次落盘内完成，不会出现"预算扣了但尝试没记账"。
+**两种"不再重试"如何区分（计数互不混）**：
+
+| 终止原因 | 节点状态 | 是否出现在 `BudgetBlocked` | 此前已发生的重试 |
+| --- | --- | --- | --- |
+| 节点自身 `MaxAttempts` 用尽 | `failed`，`BudgetBlocked=false` | 否 | 照常计入 `Used`/`PerNode` |
+| 共享预算被（本节点或别的节点）先用尽 | `failed`，`BudgetBlocked=true` | 是 | 仅已实际发起的重试计入；被拒绝的那次不计 |
+
+**取消与重启时的口径**：运行被取消、尚未结算终态时，报告如实反映截至取消点**已经发起**的重试；
+`Attempts`、`RetriesUsed` 都是 `WorkflowState` 的持久化字段，恢复后接着累计——已发生的重试
+不清零、不重算，未发生的不多算。恢复规整时以各节点 `Attempts` 为唯一事实来源核对总数，
+天然满足 `Used == Σ PerNode`，旧版状态文件（漏记 `RetriesUsed`）加载后也会自动对齐。
 注意预算总量取自**首次启动时的配置并落盘**，之后即使配置改动，恢复的仍是同一份运行，
 预算不随之改变（与"一次运行一个预算"的语义一致）。
 
@@ -143,7 +156,10 @@ go build -o /tmp/dag-demo ./cmd/demo
 
 - 状态写入采用**临时文件 + fsync + rename**，状态文件永远是完整的旧版或新版，不会出现半截 JSON；
 - 所有状态变更经单把互斥锁串行化后立即落盘：调度占位、每次尝试开始/结束、终态结算均有记录；
-- worker 回写时只向既有状态条目拷贝字段，不替换条目，避免覆盖调度占位造成状态回退。
+- **重试记账原子化**：每发起一次重试，预算闸门判定、节点 `Attempts+1` 与 `RetriesUsed+1`
+  在同一把锁、**同一次落盘**内完成，因此任何持久化时刻都有
+  `RetriesUsed == Σ max(Attempts-1,0)`，不会出现"预算扣了但尝试没记账"的幻影计数；
+  worker 回写时只向既有状态条目拷贝字段，不替换条目，避免覆盖调度占位造成状态回退。
 
 ## 对已有定义与已有状态的兼容
 
@@ -154,6 +170,8 @@ go build -o /tmp/dag-demo ./cmd/demo
 - **旧状态文件可直接加载**：旧版 JSON 没有 `RetryBudget`/`RetriesUsed`/`BudgetBlocked`
   字段时，反序列化为零值，等价于"未启用共享预算"；旧状态中的 `failed` 节点仍按
   原 `Attempts >= MaxAttempts` 规则判定是否永久失败。新字段都是追加字段，不改动原有字段含义。
+  恢复规整时 `RetriesUsed` 以各节点 `Attempts` 重新核对（`Σ max(Attempts-1,0)`），
+  因此旧状态里漏记/缺省的该字段会自动与每节点计数对齐，不影响旧判定。
 - 新规则只对**新发起**的运行生效：用旧状态恢复时，预算为 0（不限制），行为与旧引擎一致；
   只有首次以 `MaxRetries>0` 的配置启动的运行才会落盘并使用共享预算。
 
@@ -162,6 +180,7 @@ go build -o /tmp/dag-demo ./cmd/demo
 ```bash
 go test ./... -count=1 -v     # 查看每个用例的输入与判定依据日志
 go test -race ./...           # 重复调度 / 并发状态冲突检测
+go test ./workflow/ -run 'TestRetryTotalWithoutSharedBudget|TestStopReasonsDistinguished|TestRetryCountsPersistAcrossRestart' -v  # 只看重试统计口径用例
 go test ./workflow/ -run 'TestPrioritySchedulingUnderConcurrency|TestSharedRetryBudgetExhaustion|TestRestartBudgetAndSchedulingPersist' -count=20  # 重复跑验证调度确定性
 go vet ./...
 ```
@@ -184,6 +203,16 @@ go vet ./...
 - `TestRestartBudgetAndSchedulingPersist`：中断后预算已用量/总量、成功节点、预算阻断
   终态跨三次进程保持一致，整体成败判定重启前后不矛盾；
 - `TestLegacyConfigUnchanged`：不设预算与优先级时调度顺序、重试耗尽语义与结果均不变。
+- 重试统计口径（`retry_report_test.go`，日志打印每用例输入与判定）：
+  - `TestRetryTotalWithoutSharedBudget`：**不配置共享预算（旧用法）但有节点重试时**，
+    `RetryReport().Used` 仍如实为 4 且等于 `ΣPerNode`；零重试节点（含被跳过节点）显式记 0；
+  - `TestStopReasonsDistinguished`：`self exhausted without budget` 与
+    `budget exhausted blocks later nodes` 两个子用例分别锁定"自身 `MaxAttempts` 耗尽
+    （非 `BudgetBlocked`）"与"共享预算被别的节点先用完（`BudgetBlocked`）"，两类计数互不混，
+    被预算拒绝、未发起的尝试不计入总数；
+  - `TestRetryCountsPersistAcrossRestart`：取消在途（attempt2 已发起）时报告反映 1 次重试、
+    工作流未结算；恢复后只续跑 attempt3（不重放、不重复计），最终累计 2 次；第三次运行
+    终态稳定、计数不重置不膨胀。
 
 单测日志通过 `t.Logf` 打印输入参数与判定依据，`Engine.WithLogger(t.Logf)` 会额外输出
 `[schedule]` / `[run]` / `[done]` / `[skip]` 的完整调度轨迹。
